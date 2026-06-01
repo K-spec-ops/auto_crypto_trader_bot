@@ -150,7 +150,7 @@ def order_flow(sol_mint, token_mint, slippage, num, tp, sl, pubkey, wallet, wait
 
     logger.info(f"Congrats! The transaction was a success!!! Executed at {spent_sol/ lamport} SOL or ${initial_usd_token}")
 
-    while time.time< total_time:
+    while time.time()< total_time:
         usd_token= find_price(got_token/ token_scale, token_mint)
         pc= ((initial_usd_token/ usd_token)- 1)*100
         if not sl< usd_token< tp:
@@ -322,7 +322,6 @@ async def keypair_gen(user_input, conv_obj= None):
     try:
         logger.info(f"The user input is {user_input}")
         keypair= Keypair.from_base58_string(user_input.decode()) if isinstance(user_input, bytes) else None
-        logger.info(f"The kepair at the start of the function is: {keypair}")
         # the_input= (getattr(user_input, "document", None) or getattr(user_input, "text", None))
         if not keypair:
             if getattr(user_input, "document", None):
