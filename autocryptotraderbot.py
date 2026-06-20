@@ -1,15 +1,20 @@
 # bot to trade crypto based on messages received in Telegram channels
 # Next time, use a STATE DESIGN PATTERN 
+# change more logger messages to DEBUG
+# run on AWS Fargate
 
 from importscript import *
 
 date= datetime.now().strftime("%Y %m %d %I%M").split(" ")
 filename= f"mybot_{date[0]}_{date[1]}_{date[2]}.log" 
 logger = logging.getLogger(__name__)
-logging.basicConfig(filename= filename, level=logging.INFO, 
+logging.basicConfig(filename= filename, level=logging.INFO, # you have debug messages 
                             filemode= "w",
                             format="%(asctime)s - %(levelname)s - %(message)s",
                             datefmt="%Y-%m-%d %H:%M:%S")
+
+handler= RotatingFileHandler(filename, maxBytes= 5e+6, backupCount= 3) # clear_space command with this?
+logger.addHandler(handler)
 
 api_id= os.environ["TELEGRAM_API_ID"]
 api_hash= os.environ["TELEGRAM_API_HASH"]
@@ -25,6 +30,9 @@ session_name_dict= {}
 
 # for listener
 current_task= {}
+
+# for 2FA
+auth_flag= {}
 
 http_session= None
 bot= TelegramClient("bot", api_id, api_hash)
@@ -46,9 +54,17 @@ with db_conn("userinfo.db") as db_1, db_conn("translog.db") as db_2:
     db_1.execute("CREATE TABLE IF NOT EXISTS info(userID, hash, salt_auth, salt_enc, enc_key, enc_data, is_str)")
     db_2.execute("CREATE TABLE IF NOT EXISTS info(userID, token_wallet, session)")
 
+def aws_config():
+    pass
+
+def sweep():
+    pass
+
 @bot.on(events.NewMessage(pattern=r'^/')) # to interrupt telegram functions when a user sends another function call
 async def fork(event):
     id= event.sender_id
+    retries= 5
+
     functions= {**{"/"+ key: key for key, value in globals().items() if (callable(value) and key!= "main" and value.__module__== __name__)}, 
                                                                                                     "/2FA": "twoFA"} # prevent user code injection
     if id in active_tasks:
@@ -61,25 +77,28 @@ async def fork(event):
     
     if event.text in functions:
         active_tasks[id]= asyncio.create_task(eval(functions[event.text]+ "(event)"))
+    
+    return
 
 async def call_wrap(url, method, retries= 15, **kwargs): # change to aiohttp at some point b/c highly async 
     """Wrapper for API calls."""
     for r in range(1, retries+1):
         try:
             response= await http_session.request(method, url, raise_for_status= True, **kwargs)  
-            logger.info(f"The {url} API call was successful! Params: {kwargs}") 
+            if r> 1:
+                logger.info(f"The {url} API call was successful! Params: {kwargs}") # you could also just set this to debug
             return response
         except aiohttp.ClientResponseError as e:
                 code= e.status
                 if 400 <= code <= 499:
                     if code== 429:
-                        logger.error(f"API calls have been rate-limited. Retry {r}", exc_info= True)
+                        logger.error(f"API calls have been rate-limited. Retry {r}")
                         await asyncio.sleep(r)
                         continue
-                    logger.error(f"Client side error: {e}", exc_info= True)
+                    logger.critical(f"Client side error: {e}")
                     break
                 else: 
-                    logger.error(f"Internal server error: {e}. Retry {r}", exc_info= True)
+                    logger.error(f"Internal server error: {e}. Retry {r}")
                     await asyncio.sleep(r) # might not need this
                     continue
         except aiohttp.ClientError as e:
@@ -96,7 +115,7 @@ async def find_price(num_tokens, mint):
     token_base_url= "https://api.jup.ag/tokens/v2/"
     #price_response= requests.get(token_base_url+ "search", headers= {"x-api-key": jup_api_key}, params= {"query": mint}).json()
 
-    price_response= await call_wrap(token_base_url+ "search", "get", headers= {"x-api-key": jup_api_key}, params= {"query": mint}).json()
+    price_response= await (await call_wrap(token_base_url+ "search", "get", headers= {"x-api-key": jup_api_key}, params= {"query": mint})).json()
 
     return num_tokens* price_response[0]["usdPrice"]
 
@@ -104,10 +123,10 @@ async def decimals(mint):
     """Find out how many decimals are in the base token."""
     sol_url= "https://api.mainnet.solana.com"
     
-    sol_response= await call_wrap(sol_url, "post", headers= {"Content-type": "application/json"}, json= {"jsonrpc": "2.0",
+    sol_response= await (await call_wrap(sol_url, "post", headers= {"Content-type": "application/json"}, json= {"jsonrpc": "2.0",
                                                                                                 "id": 1,
                                                                                                 "method": "getTokenSupply",
-                                                                                                "params": [mint]}).json()
+                                                                                                "params": [mint]})).json()
     
     logger.info(sol_response)
     return float("1"+ "".join(["0" for _ in range(sol_response["result"]["value"]["decimals"])]))
@@ -117,11 +136,11 @@ async def transaction(input_mint, output_mint, num, slippage, **kwargs):
     base_url= "https://api.jup.ag/swap/v2/"
     x= SimpleNamespace(**kwargs)
     
-    order_response= await call_wrap(base_url+ "order", "get", headers= {"x-api-key": jup_api_key}, params= {"inputMint": input_mint,
+    order_response= await (await call_wrap(base_url+ "order", "get", headers= {"x-api-key": jup_api_key}, params= {"inputMint": input_mint,
                                                                                "outputMint": output_mint,
                                                                                "taker": x.my_pub_key,
                                                                                "amount": num, # amount of sol to use to buy the token
-                                                                               **({"slippageBps": slippage} if slippage is not None else {})}).json()
+                                                                               **({"slippageBps": slippage} if slippage is not None else {})})).json()
     swap_instruction= order_response["transaction"]
     requestId= order_response["requestId"]
     lastValidBlockHeight= order_response["lastValidBlockHeight"]
@@ -130,20 +149,21 @@ async def transaction(input_mint, output_mint, num, slippage, **kwargs):
     signed_tx= VersionedTransaction(raw_tx.message, [x.wallet])
     encoded_tx= base64.b64encode(bytes(signed_tx)).decode()
     
-    execute_response= await call_wrap(base_url+ "execute", "post", headers= {"x-api-key": jup_api_key}, json= {"signedTransaction": encoded_tx, 
+    execute_response= await (await call_wrap(base_url+ "execute", "post", headers= {"x-api-key": jup_api_key}, json= {"signedTransaction": encoded_tx, 
                                                                                                     "requestId": requestId,
-                                                                                                    "lastValidBlockHeight": lastValidBlockHeight}).json()
+                                                                                                    "lastValidBlockHeight": lastValidBlockHeight})).json()
     
     if execute_response["status"].lower()== "success":
         return execute_response
     else:
         error_str, code= execute_response["error"], execute_response["code"]
-        logger.error(f"Failed transaction! Error code {code} with reason: {error_str}", exc_info= True)
+        logger.critical(f"Failed transaction! Error code {code} with reason: {error_str}")
     
     return
 
-async def order_flow(stop_event, wait= 300, **kwargs):
+async def order_flow(stop_event, wait, **kwargs):
     """The current transaction flow for all interpreters."""
+    got_token= None # protect cancellation
     x= SimpleNamespace(**kwargs)
 
     try:
@@ -154,34 +174,43 @@ async def order_flow(stop_event, wait= 300, **kwargs):
         spent_sol= float(bought["inputAmountResult"])
         got_token= float(bought["outputAmountResult"])
         initial_usd_token= await find_price(got_token/ token_scale, x.token_mint)
-        total_time= time.time()+ wait
+        total_time= time.time()+ (wait if wait!= 0 else np.inf)
         interval= 1.2 # internal param
 
         logger.info(f"Congrats! The transaction was a success!!! Executed at {spent_sol/ lamport} SOL or ${initial_usd_token}")
+        await bot.send_message(x.id, f"<b>I HAVE JUST BOUGHT:</b>\n\n<i>ADDRESS:</i> {x.token_mint}\n" \
+                            f"<i>AMOUNT:</i> {got_token}\n<i>PRICE SOL:</i> {spent_sol/ lamport:.3f}\n<i>PRICE USD:</i> {initial_usd_token:.3f}", parse_mode= "html")
 
         while time.time()< total_time:
             if stop_event.is_set():
-                logger.info("Trading has been stopped by the user.")
                 break
             usd_token= await find_price(got_token/ token_scale, x.token_mint)
             pc= ((usd_token/ initial_usd_token)- 1)*100
             if not -x.sl<= pc<= x.tp:
                 logger.info(f'''The price of the token with address {x.token_mint[:7]}... has gone past your stop loss or take profit. You bought at {initial_usd_token} and 
-                            are selling at {usd_token}. This is a percent change of {pc} (pending any slippage or fees).''')
-                _ = await transaction(x.token_mint, x.sol_mint, str(int(got_token)), x.slippage, my_pub_key= x.pubkey, wallet= x.wallet) 
+                            are selling at {usd_token} (pending any slippage or fees). This is a percent change of {pc}.''')
+                await transaction(x.token_mint, x.sol_mint, str(int(got_token)), x.slippage, my_pub_key= x.pubkey, wallet= x.wallet) 
                 break
             await asyncio.sleep(interval) # to make interruptible
-            #else:
-            #    logger.info(f"The amount of token with address {x.token_mint[:7]}... recieved is worth ${usd_token} and it has increased {pc}% from when it was bought.")
-            #    await asyncio.sleep(interval)
+
+        else:
+            logger.info(f"Trading time of {wait} seconds has been exceeded. Selling remaining tokens...")
+            await transaction(x.token_mint, x.sol_mint, str(int(got_token)), x.slippage, my_pub_key= x.pubkey, wallet= x.wallet) 
+
         return
     
     except asyncio.CancelledError:
-        try:
-            logger.info(f"Trade has been cancelled by the user. Initiating sale of {x.token_mint}...")
-            _= await transaction(x.sol_mint, x.token_mint, str(ceil(x.num* lamport)), x.slippage, my_pub_key= x.pubkey, wallet= x.wallet)
-        except Exception as e:
-            logger.error(f"Failed to sell token after cancellation: {e}", exc_info= True)
+        if got_token is not None:
+            try:
+                logger.info(f"Trade has been cancelled by the user. Initiating sale of {x.token_mint}...")
+                await asyncio.shield(transaction(x.token_mint, x.sol_mint, str(int(got_token)), x.slippage, my_pub_key= x.pubkey, wallet= x.wallet))
+            except Exception as e:
+                logger.critical(f"Failed to sell token after cancellation: {e}")
+        
+        return
+    
+    except Exception as e:
+        logger.critical(f"Order flow error: {e}")
         
     return 
 
@@ -248,19 +277,34 @@ class Interpreter:
     
     async def first_interpreter(self, msg= None):
         logger.info("I'm interpreting!")
+        found= False
         try:
             if msg:
                 for line in msg.splitlines():
                     match= re.search(r"jup\.ag/swap/SOL-([A-Za-z0-9]+)", line, re.IGNORECASE)
                     if match:
+                        found= True
                         token= match.group(1)
                         logger.info(f"I will buy the token with address {token}.")
-                        await order_flow(self.sol, token, self.slippage, self.amount, self.tp, self.sl, self.pubkey, self.wallet, self.wait_time)
+                        await order_flow(self.stop_event, 
+                                         sol_mint= self.sol, 
+                                         token_mint= token, 
+                                         slippage= self.slippage, 
+                                         num= self.amount, 
+                                         tp= self.tp, 
+                                         sl= self.sl, 
+                                         pubkey= self.pubkey, 
+                                         wallet= self.wallet, 
+                                         wait= self.wait_time, 
+                                         id= self.id)
+                if not found:
+                    logger.info("I don't recognize this message. Are you sure this is from the right group?")
+                    
         except (NameError, AttributeError):
             logger.critical("No message was passed to the interpreter!")
         
         with db_conn("translog.db") as db:
-            db.execute("INSERT OR IGNORE INTO info(token_wallet) VALUES (?)", (token,))
+            db.execute("INSERT OR IGNORE INTO info(token_wallet, session) VALUES (?, ?)", (token, session_name_dict[self.id]))
 
         return
 
@@ -280,7 +324,7 @@ async def create_listener(id, num_messages, **kwargs): # the "event.sender_id" f
         task= current_task.get(id)
 
         if task and not task.done():
-            logger.info("Waiting for trade to complete before looking at another message.")
+            logger.debug("Waiting for trade to complete before looking at another message.")
             return
         
         current_task[id]= asyncio.create_task(listener(event))
@@ -289,9 +333,11 @@ async def create_listener(id, num_messages, **kwargs): # the "event.sender_id" f
         logger.info("I'm listening.")
         nonlocal read
 
-        chosen_method= getattr(Interpreter(slippage= args.slippage, 
+        chosen_method= getattr(Interpreter(slippage= args.slippage,
+                                           id= id, 
                                            tp= args.tp, 
                                            sl= args.sl, 
+                                           stop_event= stop_event,
                                            amount= args.amount, 
                                            wait_time= args.wait_time,
                                            pubkey= args.pubkey,
@@ -307,9 +353,11 @@ async def create_listener(id, num_messages, **kwargs): # the "event.sender_id" f
     args.client.add_event_handler(inserter, events.NewMessage(chats= args.group))
 
     if args.num_text.endswith("m"):
-        await asyncio.sleep(args.num_text[:-1]*60)
+        await asyncio.sleep(int(args.num_text[:-1])*60)
+        stop_event.set()
     elif args.num_text.endswith("h"):
-        await asyncio.sleep(args.num_text[:-1]*3600)
+        await asyncio.sleep(int(args.num_text[:-1])*3600)
+        stop_event.set()
     else:
         await stop_event.wait()
     
@@ -323,46 +371,47 @@ async def create_listener(id, num_messages, **kwargs): # the "event.sender_id" f
 
     return
 
-async def keypair_gen(user_input, chat_id):
-    with bot.conversation(chat_id) as conv:
-        try:
-            keypair= Keypair.from_base58_string(user_input.decode()) if isinstance(user_input, bytes) else None
-            if not keypair:
-                if getattr(user_input, "document", None):
-                    if user_input.document.mime_type== "application/json": # .json methods
-                        json_file= await user_input.download_media()
-                        with open(json_file, "r") as f:
-                            secret= json.load(f)
-                            try:
-                                keypair= Keypair.from_bytes(secret)
-                            except Exception as e:
-                                logger.error(f"Keypair ran into a problem: {e}")
-                                await conv.send_message("Unable to verify a keypair. Please correct your .json.")
-                    else:
-                        await conv.send_message("It seems like you didn't attach a .json file. Please try again.")
-                    os.remove(user_input.document.attributes[-1].file_name)
-                elif getattr(user_input, "text", None):
-                    splitted= user_input.split(" ")
-                    if len(splitted)> 1 and re.search(r"/", splitted[-1]): # seed + derivation path
-                        seed, derivation= " ".join(splitted[:-1]), splitted[-1]
-                        keypair= Keypair.from_seed_and_derivation_path(seed, derivation)
-                    elif len(splitted)> 1: # seed phrase method
-                        try: 
-                            mnemo= Mnemonic("english")
-                            seed= mnemo.to_seed(user_input)
-                            keypair= Keypair.from_seed(seed[:32])
-                        except Exception as e:
-                            logger.error(f"Keypair ran into a problem: {e}", exc_info= True)
-                            await conv.send_message("Unable to verify a keypair. Please correct your seed phrase.")
-                    else: # base58
+async def keypair_gen(user_input, conv):
+    logger.debug(f"The user input is {user_input}")
+    #async with bot.conversation(chat_id) as conv:
+    try:
+        keypair= Keypair.from_base58_string(user_input.decode()) if isinstance(user_input, bytes) else None
+        if not keypair:
+            if getattr(user_input, "document", None):
+                if user_input.document.mime_type== "application/json": # .json methods
+                    json_file= await user_input.download_media()
+                    with open(json_file, "r") as f:
+                        secret= json.load(f)
                         try:
-                            keypair= Keypair.from_base58_string(user_input)
+                            keypair= Keypair.from_bytes(secret)
                         except Exception as e:
-                            logger.error(f"Keypair ran into a problem: {e}")
-                            await conv.send_message("I've detected that you are trying to provide a base58 string. I cannot verify a keypair. Please correct your string or use a different method.")
-        except Exception as e:
-            await conv.send_message("An unexpected error happened. Please try again.")
-            logger.critical(f"Unexpected error: {e}")
+                            logger.critical(f"Keypair ran into a problem: {e}")
+                            await conv.send_message("Unable to verify a keypair. Please correct your .json.")
+                else:
+                    await conv.send_message("It seems like you didn't attach a .json file. Please try again.")
+                os.remove(user_input.document.attributes[-1].file_name)
+            elif getattr(user_input, "text", None):
+                splitted= user_input.split(" ")
+                if len(splitted)> 1 and re.search(r"/", splitted[-1]): # seed + derivation path
+                    seed, derivation= " ".join(splitted[:-1]), splitted[-1]
+                    keypair= Keypair.from_seed_and_derivation_path(seed, derivation)
+                elif len(splitted)> 1: # seed phrase method
+                    try: 
+                        mnemo= Mnemonic("english")
+                        seed= mnemo.to_seed(user_input)
+                        keypair= Keypair.from_seed(seed[:32])
+                    except Exception as e:
+                        logger.critical(f"Keypair ran into a problem: {e}")
+                        await conv.send_message("Unable to verify a keypair. Please correct your seed phrase.")
+                else: # base58
+                    try:
+                        keypair= Keypair.from_base58_string(user_input)
+                    except Exception as e:
+                        logger.critical(f"Keypair ran into a problem: {e}")
+                        await conv.send_message("I've detected that you are trying to provide a base58 string. I cannot verify a keypair. Please correct your string or use a different method.")
+    except Exception as e:
+        await conv.send_message("An unexpected error happened. Please try again.")
+        logger.critical(f"Unexpected error: {e}")
 
     return keypair
 
@@ -437,6 +486,8 @@ async def callback(event):
 
 async def login(event): # to prevent SQLite locks
     """Login a user to Telegram."""
+    logger.info("Performing actions from command '/login'...")
+
     id= event.sender_id # got tired of typing it out
 
     if id not in user_locks:
@@ -456,7 +507,7 @@ async def login(event): # to prevent SQLite locks
             user_clients[id]= client
         
         await client.connect()
-        async with bot.conversation(event.chat_id) as conv:
+        async with bot.conversation(event.chat_id, timeout= None) as conv:
             if not await client.is_user_authorized():
                 msg= await conv.send_message("Please choose your login method.", 
                                 buttons= [Button.inline("Phone Code", b"phone"), Button.inline("QR Code", b"QR")])
@@ -471,7 +522,7 @@ async def login(event): # to prevent SQLite locks
                             try:
                                 phone= phonenumbers.parse((await conv.get_response()).text)
                             except NumberParseException as e:
-                                logger.error(f"Something went wrong while parsing the user's phone number: {e}")
+                                logger.exception(f"Something went wrong while parsing the user's phone number: {e}")
                                 await conv.send_message("You wrote your phone number in an unrecognized format. Please try again.")
                                 continue
                             if not phonenumbers.is_valid_number(phone): # and phonenumbers.is_possible_number(phone)
@@ -484,19 +535,28 @@ async def login(event): # to prevent SQLite locks
                                 await conv.send_message(
                                     f"Telegram has temporarily limited login code requests. "
                                     f"Please try again in approximately {round(e.seconds/3600, 1)} hours.")
-                                logger.error(f"Flood wait: {e.seconds} seconds.")
+                                logger.exception(f"Flood wait: {e.seconds} seconds.")
                                 return
                             except errors.PhoneNumberBannedError:
                                 await conv.send_message("Your phone number is banned. You will not be able to sign in with it. Please try again.")
                                 continue
                             except Exception as e:
                                 await conv.send_message("An unknown error occurred. Please try again.")
-                                logger.error(f"Telethon couldn't send a code to the user's number: {e}")
+                                logger.exception(f"Telethon couldn't send a code to the user's number: {e}")
                                 continue
                             break
 
                         timeout= f"expire in {login_token.timeout} seconds" if login_token.timeout else "not expire"
-                        await conv.send_message(f"A login code was sent to your Telegram. It will {timeout}. Please write it here. You can run '/login' again if you didn't receive it.")
+                        
+                        text= "As a security measure, Telegram will immediately expire any code which has been sent to another account or bot " \
+                              "using their service. In order for the login to work, you must obfuscate your code before sending it. The easiest way to " \
+                              "do this is to prepend a character to your code (e.g. if your code is 12345, you would type s12345 or *12345). In fact, " \
+                              "nearly any obfuscation should work so long as it preserves the original order of the code."
+                        
+                        await conv.send_message(f"A login code was sent to your Telegram. It will {timeout}. " \
+                                                f"Please write it here. You can run '/login' again if you didn't receive it.\n\n " \
+                                                f"<b><i>IMPORTANT:</i></b>\n{text}", parse_mode= "html") # bold * and italics _
+                        
                         while True:
                             code= await conv.get_response()
                             try:
@@ -505,13 +565,14 @@ async def login(event): # to prevent SQLite locks
                                 await conv.send_message("Incorrect code. Try again.")
                                 continue
                             except errors.rpcerrorlist.PhoneCodeExpiredError:
-                                await conv.send_message("Your code has expired. This may be because it timed out or because you forgot to obfuscate. " \
+                                await conv.send_message("Your code has expired. This is probably because you forgot to obfuscate or did it wrong. " \
                                                                                                     "Please run '/login' again. ")
                                 return
                             except errors.SessionPasswordNeededError:
                                 await conv.send_message("2FA is enabled for this account. Please provide your password.")
                                 while True:
                                     password= await conv.get_response()
+                                    await password.delete()
                                     try:
                                         await client.sign_in(password= password.text)
                                     except errors.PasswordHashInvalidError:
@@ -554,26 +615,39 @@ async def login(event): # to prevent SQLite locks
 
 async def start(event):
     """Sends a welcome message to the user when they start the bot."""
+    logger.info("Performing actions from '/start'...")
+
     await bot.send_message(event.sender_id, "Hello! I am a crypto trading bot that is currently in development.") 
 
+    return
+
 # bring this back at some point
-'''async def twoFA(event):
+async def twoFA(event):
     """Allows user to enable 2FA."""
-    if auth_flag:
+    logger.info("Performing actions from '/twoFA'...")
+
+    id= event.sender_id
+
+    await bot.send_message(id, "This area is under construction.")
+    '''if auth_flag:
         await bot.send_message(event.sender_id, "It seems you have already enabled 2FA. Would you like to disable it?",
                                buttons=[Button.inline('Yes', b'yes_auth_1'), Button.inline('No', b'no_auth_1')])
     else:
         await bot.send_message(event.sender_id, "Would you like to enable 2FA?",
                                buttons=[Button.inline('Yes', b'yes_auth_2'), Button.inline('No', b'no_auth_2')])'''
+    
+    return
 
-async def stats(event):
+async def stats(event): # fix this
     """Display user PnL and win rate."""
+    logger.info("Performing actions from '/stats'...")
+
     base_url= "https://api.mobula.io/api/"
     id= event.sender_id
 
     wallet= wallet_dict.get(id)
     if not wallet:
-        await bot.send_message(id, "It looks like you haven't ran the bot yet. Start trading and look at your wins (or losses)!")
+        await bot.send_message(id, "It looks like you haven't ran '/trade' yet. Start trading and look at your wins (or losses)!")
         return
     
     with db_conn("translog.db") as db:
@@ -582,32 +656,32 @@ async def stats(event):
 
     data= requests.get(base_url+ "2/wallet/positions", headers= {"Authorization": mob_api_key}, params= {"wallet": wallet,
                                                                                              "blockchains": "solana"}).json()["data"]
-    # test; delete when complete
-    one_address= next(trade["token"]["address"] for trade in data)
-    logger.info(f"Here is a token address: {one_address}")
 
     # total PnL and Win rate
     tot_pnl= [trade["realizedPnlUSD"]- trade["totalFeesPaidUSD"] for trade in data]
     tot_win= (sum(1 for pnl in tot_pnl if pnl> 0)/ len(tot_pnl))* 100 if len(tot_pnl)> 0 else 0
     
-    message_1= f"\033[1mOVERALL STATS:\033[0m\nPnL: {sum(tot_pnl)}\nWin Rate: {tot_win}"
-    message_2= "\033[1mSESSION STATS:\033[0m\nN/A"
+    message_1= f"<b>OVERALL STATS:</b>\nPnL: ${sum(tot_pnl):.3f}\nWin Rate: {tot_win:.3f}%"
+    message_2= "<b>SESSION STATS:</b>\nN/A"
 
     if sesh_wall:
         sesh_pnl= [trade["realizedPnlUSD"]- trade["totalFeesPaidUSD"] for trade in data 
                                         if trade["token"]["address"] in sesh_wall]
         sesh_win= (sum(1 for pnl in sesh_pnl if pnl> 0)/ len(sesh_pnl))* 100 if len(sesh_pnl)> 0 else 0
-        message_2= f"\033[1mSESSION STATS:\033[0m\nPnL: {sum(sesh_pnl)}\nWin Rate: {sesh_win}"
+        message_2= f"\n\n<b>SESSION STATS:</b>\nPnL: ${sum(sesh_pnl):.3f}\nWin Rate: {sesh_win:.3f}%"
     
-    await bot.send_message(id, message_1+ message_2)
+    await bot.send_message(id, message_1+ message_2, parse_mode= "html")
+
     return 
 
 async def wipe(event):
     """Allows a user to erase all stored personal data."""
+    logger.info("Performing actions from '/wipe'...")
+
     id= event.sender_id
     
-    async with bot.conversation(event.chat_id) as conv:
-        msg= await conv.send_message(id, "This option will erase any personal data that has been stored. You will be prompted to provide another password and reenter your wallet details when you run '/trade'. Do you want to continue?",
+    async with bot.conversation(event.chat_id, timeout= None) as conv:
+        msg= await conv.send_message("This option will erase any personal data that has been stored. You will be prompted to provide another password and reenter your wallet details when you run '/trade'. Do you want to continue?",
                           buttons=[Button.inline('Yes', b'yes'), Button.inline('No', b'no')])
         choice= await conv.wait_event(events.CallbackQuery(func= lambda x: x.sender_id== id and x.message_id== msg.id))
         await msg.delete()
@@ -634,11 +708,12 @@ async def wipe(event):
 async def trade(event):
     """Main trading logic."""
     logger.info("Performing actions from command '/trade'...")
+
     id= event.sender_id
     
     client= user_clients.get(id)
     
-    async with bot.conversation(id) as conv:
+    async with bot.conversation(id, timeout= None) as conv:
         if not client:
             await conv.send_message("Please login to your Telegram account using '/login' before running this command.")
             return
@@ -648,17 +723,19 @@ async def trade(event):
             user_hash, user_salt_auth, user_salt_enc, user_enc_key, user_enc_data, check= row_pswd or [None for _ in range(6)]
         
             sess_name= "".join([choice(ascii_letters+ digits) for _ in range(15)]) # low collision prob (birthday problem)
+            logger.debug(f"Here is the sess_name: {sess_name}")
             session_name_dict[id]= sess_name
             db_2.execute("INSERT OR IGNORE INTO info(userID, session) VALUES (?, ?)", (id, sess_name))
 
         if not any([user_hash, user_salt_auth, user_salt_enc, user_enc_key, user_enc_data, check]):
             await conv.send_message("I need your info to send transactions! First, please specify a *strong* password to use when accessing your wallet in the future.")
             user_password= await conv.get_response()
+            await user_password.delete()
             await conv.send_message("You have four options to provide your wallet details: \n\n1. Attach a keypair .json \n2. Provide the secret key in base58 format \n3. Provide your seed phrase \n4. Provide your seed phrase and derivation path (e.g. *your seed phrase* m/44'/501'/0'/0')")
             while True:
                 info_mes= await conv.get_response(timeout= 300)
                 try:
-                    keypair=  await keypair_gen(info_mes, event.chat_id)
+                    keypair=  await keypair_gen(info_mes, conv)
                 except Exception:
                     continue
                 break 
@@ -670,6 +747,7 @@ async def trade(event):
             await conv.send_message("Please enter your password.")
             while True:
                 attempt= await conv.get_response()
+                await attempt.delete()
                 try:
                     secret= my_decrypt(attempt.text, user_hash, user_salt_auth, user_salt_enc, user_enc_key, user_enc_data, check)
                 except Exception as e:
@@ -678,7 +756,7 @@ async def trade(event):
                     continue
                 break
             try:
-                keypair= await keypair_gen(secret, event.chat_id)
+                keypair= await keypair_gen(secret, conv)
             except Exception:
                 await conv.send_message("Sorry, your details couldn't be used to generate a keypair. This may be due to corruption or some other reason. Please rerun '/trade'. You will be prompted to create another password. It can be the same as the last one, but this isn't recommended.")
                 delete_user_info(event) 
@@ -689,7 +767,7 @@ async def trade(event):
             delete_user_info(event)
             return
         
-        pubkey= keypair.pubkey()
+        pubkey= str(keypair.pubkey()) # used to be without str()
 
         wallet_dict[id]= pubkey
 
@@ -760,15 +838,21 @@ async def trade(event):
 
         await conv.send_message("How much SOL would you like to trade with?")
         amount= await conv.get_response()
-        await conv.send_message("Please set a max duration (in seconds) for which to sell the token after buying. If you'd like to always wait until the stop loss/take profit have been hit, you can type '0'.")
-        wait_time= await conv.get_response()
+        await conv.send_message("Please set a max duration (in whole seconds) for which to sell the token after buying. If you'd like to always wait until the stop loss/take profit have been hit, you can type '0'.")
+        while True:
+            try: 
+                wait_time= abs(int((await conv.get_response()).text.strip()))
+            except ValueError:
+                conv.send_message("You have specified an invalid wait time. Please try again.")
+                continue
+            break
 
         msg= await conv.send_message("Would you like to set your slippage manually or allow Jupiter to automate it?",
                                buttons=[Button.inline("I'll do it", b"manual"), Button.inline("Let Jupiter handle it", b"auto")]) # have to do a wait_event here
-        choice= await conv.wait_event(events.CallbackQuery(func= lambda x: x.sender_id== id and x.message_id== msg.id)) # wait for button logic to be completed
+        u_choice= await conv.wait_event(events.CallbackQuery(func= lambda x: x.sender_id== id and x.message_id== msg.id)) # wait for button logic to be completed
         await msg.delete()
 
-        if choice.data== b"manual":
+        if u_choice.data== b"manual":
             await conv.send_message("Please specify your slippage in basis points (100 bp -> 1% difference between the quoted and execution price).")
             while True:
                 slippage= await conv.get_response()
@@ -779,7 +863,7 @@ async def trade(event):
                 break
             slippage_dict[id]= slippage
         
-        if choice.data== b"auto":
+        if u_choice.data== b"auto":
             await conv.send_message("Good choice! Jupiter typically deals with slippage well.")
     
         await conv.send_message("Let's do some work...")
@@ -793,17 +877,21 @@ async def trade(event):
                                     tp= upper,
                                     sl= lower,
                                     amount= float(amount.text),
-                                    wait_time= int(wait_time.text),
+                                    wait_time= wait_time,
                                     slippage= slippage_dict.get(id),
                                     pubkey= pubkey,
                                     wallet= keypair)
     except Exception as e:
-        logger.error(f"This didn't work: {e}", exc_info= True)
+        logger.critical(f"This didn't work: {e}")
 
-    logger.info("'/trade' command was successful!")
+    logger.info("I'm finished trading!")
+
+    return
 
 async def stop(event):
     """Immediately stop all trading activity."""
+    logger.info("Performing actions from command '/stop'...")
+
     id= event.sender_id
 
     task= current_task.get(id)
@@ -816,27 +904,9 @@ async def stop(event):
         task.cancel()
         await bot.send_message(id, "All trades have been successfully shut down.")
     except Exception as e:
-        logger.error(f"Something went wrong with /stop: {e}")
-    
+        logger.critical(f"Something went wrong with /stop: {e}")
 
-async def test(event):
-    """A simple test to check if the bot is working properly."""
-    logger.info("Performing actions from command '/test'...")
-    try: 
-        async with bot.conversation(event.chat_id) as conv:
-            me= await bot.get_me()
-            await conv.send_message(f"Hi! This is a test message from {me.username}. Please reply with 'Hi'.")
-            while True:
-                response= await conv.get_response()
-                if response.text.lower()== "hi":
-                    await conv.send_message("Thank you for replying! This test was successful.")
-                    break
-                else:
-                    await conv.send_message("Sorry, I didn't understand your response. Please reply with 'Hi' to complete the test.")
-    except Exception as e:
-        logger.critical(f"Error occurred in '/test': {e}")
-    
-    logger.info("'/test' command was successful!")
+    return
 
 async def main(): # remember not to create separate loops or else errors- keep everything on the Telethon loop
     """Starts the script."""

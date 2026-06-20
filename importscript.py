@@ -3,8 +3,10 @@
 import qrcode
 import base64 
 import asyncio
+import textwrap
 import requests
 import aiohttp
+import phonenumbers
 import logging
 import sqlite3 as sql
 import numpy as np
@@ -29,8 +31,11 @@ from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
 
 from random import choice
 from string import ascii_letters, digits
+from logging.handlers import RotatingFileHandler
 from solders.hash import Hash
 from solders.keypair import Keypair
 from solders.message import MessageV0
 from solders.system_program import TransferParams, transfer
 from solders.transaction import VersionedTransaction
+
+from phonenumbers.phonenumberutil import NumberParseException
