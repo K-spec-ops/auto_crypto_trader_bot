@@ -30,9 +30,13 @@ session_name_dict= {}
 
 # for listener
 current_task= {}
+listener_task= {}
 
 # for 2FA
 auth_flag= {}
+
+# param to determine how long to wait after an exit signal
+sig_wait= 5
 
 http_session= None
 bot= TelegramClient("bot", api_id, api_hash)
@@ -179,7 +183,7 @@ async def order_flow(stop_event, wait, **kwargs):
 
         logger.info(f"Congrats! The transaction was a success!!! Executed at {spent_sol/ lamport} SOL or ${initial_usd_token}")
         await bot.send_message(x.id, f"<b>I HAVE JUST BOUGHT:</b>\n\n<i>ADDRESS:</i> {x.token_mint}\n" \
-                            f"<i>AMOUNT:</i> {got_token}\n<i>PRICE SOL:</i> {spent_sol/ lamport:.3f}\n<i>PRICE USD:</i> {initial_usd_token:.3f}", parse_mode= "html")
+                            f"<i>AMOUNT:</i> {got_token}\n<i>PRICE SOL:</i> {spent_sol/ lamport:.3f}\n<i>PRICE USD:</i> ${initial_usd_token:.3f}", parse_mode= "html")
 
         while time.time()< total_time:
             if stop_event.is_set():
@@ -313,6 +317,8 @@ async def create_listener(id, num_messages, **kwargs): # the "event.sender_id" f
     logger.info("I've started.")
     stop_event= asyncio.Event()
 
+    listener_task[id]= asyncio.current_task()
+
     if num_messages== 0:
             await bot.send_message(id, "You specified 0 messages to read, so the listener will not start. Please run '/trade' again.")
             return
@@ -352,23 +358,23 @@ async def create_listener(id, num_messages, **kwargs): # the "event.sender_id" f
 
     args.client.add_event_handler(inserter, events.NewMessage(chats= args.group))
 
-    if args.num_text.endswith("m"):
-        await asyncio.sleep(int(args.num_text[:-1])*60)
-        stop_event.set()
-    elif args.num_text.endswith("h"):
-        await asyncio.sleep(int(args.num_text[:-1])*3600)
-        stop_event.set()
-    else:
-        await stop_event.wait()
-    
-    args.client.remove_event_handler(inserter, events.NewMessage(chats= args.group))
-    
-    '''task.cancel()
     try:
-        await task
-    except asyncio.CancelledError:
-        pass'''
-
+        if args.num_text.endswith(("m", "h")):
+            if args.num_text.endswith("m"):
+                await asyncio.sleep(int(args.num_text[:-1])*60)
+            elif args.num_text.endswith("h"):
+                await asyncio.sleep(int(args.num_text[:-1])*3600)
+            stop_event.set()
+        else:
+            await stop_event.wait()
+    finally:
+        task= current_task.get(id)
+        if task:
+            task.cancel() # liquidate current position after time limit is reached
+            await task
+        
+        args.client.remove_event_handler(inserter, events.NewMessage(chats= args.group))
+    
     return
 
 async def keypair_gen(user_input, conv):
@@ -596,6 +602,7 @@ async def login(event): # to prevent SQLite locks
                             await conv.send_message("2FA is enabled for this account. Please provide your password.")
                             while True:
                                 password= await conv.get_response()
+                                await password.delete()
                                 try:
                                     await client.sign_in(password= password.text)
                                 except errors.PasswordHashInvalidError:
@@ -843,7 +850,7 @@ async def trade(event):
             try: 
                 wait_time= abs(int((await conv.get_response()).text.strip()))
             except ValueError:
-                conv.send_message("You have specified an invalid wait time. Please try again.")
+                await conv.send_message("You have specified an invalid wait time. Please try again.")
                 continue
             break
 
@@ -894,23 +901,42 @@ async def stop(event):
 
     id= event.sender_id
 
-    task= current_task.get(id)
+    kill_task= listener_task.get(id)
 
-    if not task:
+    if not kill_task:
         await bot.send_message(id, "There are no trades happening now...")
         return
     
     try:
-        task.cancel()
+        kill_task.cancel()
+        # await kill_task
         await bot.send_message(id, "All trades have been successfully shut down.")
     except Exception as e:
         logger.critical(f"Something went wrong with /stop: {e}")
 
     return
 
+async def s_protocol(sig, event):
+    """Facilitates a graceful exit."""
+    if event.is_set():
+        return 
+    
+    event.set()
+    logger.info(f"Recieved exit signal: {sig}. Cleaning up...")
+    await asyncio.sleep(sig_wait)
+    await bot.disconnect()
+
+    return
+
 async def main(): # remember not to create separate loops or else errors- keep everything on the Telethon loop
     """Starts the script."""
     global http_session
+    
+    teleloop= asyncio.get_event_loop()
+    shutdown= asyncio.Event()
+
+    for signame in (SIGINT, SIGTERM, SIGQUIT):
+        teleloop.add_signal_handler(signame, lambda s= signame: asyncio.create_task(s_protocol(s.name, shutdown)))
 
     http_session= aiohttp.ClientSession()
     try:
@@ -921,10 +947,7 @@ async def main(): # remember not to create separate loops or else errors- keep e
     
     logger.info("Starting Bot...")
 
-    try:
-        await bot.run_until_disconnected()
-    finally:
-        await http_session.close()
+    await bot.run_until_disconnected()
     
     return
 
