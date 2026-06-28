@@ -2,19 +2,9 @@
 # Next time, use a STATE DESIGN PATTERN 
 # change more logger messages to DEBUG
 # run on AWS Fargate
+# just use the sender_id for the logger names.
 
 from importscript import *
-
-date= datetime.now().strftime("%Y %m %d %I%M").split(" ")
-filename= f"mybot_{date[0]}_{date[1]}_{date[2]}.log" 
-logger = logging.getLogger(__name__)
-logging.basicConfig(filename= filename, level=logging.INFO,
-                            filemode= "w",
-                            format="%(asctime)s - %(levelname)s - %(message)s",
-                            datefmt="%Y-%m-%d %H:%M:%S")
-
-handler= RotatingFileHandler(filename, maxBytes= 5e+6, backupCount= 3) 
-logger.addHandler(handler)
 
 api_id= os.environ["TELEGRAM_API_ID"]
 api_hash= os.environ["TELEGRAM_API_HASH"]
@@ -27,6 +17,9 @@ user_locks, user_sessions, user_clients, active_tasks= {}, {}, {}, {}
 slippage_dict= {}
 wallet_dict= {}
 session_name_dict= {}
+
+# for logger
+username_dict= {}
 
 # for listener
 current_task= {}
@@ -46,6 +39,24 @@ time_thres= 2.16e+6 # 25 days
 http_session= None
 bot= TelegramClient("bot", api_id, api_hash)
 
+date= datetime.now().strftime("%Y %m %d %I%M").split(" ")
+filename= f"mybot_{date[0]}_{date[1]}_{date[2]}_poop.log" 
+
+def user_logger(filename):
+    """Creates a log file."""
+    logger = logging.getLogger(__name__)
+    logging.basicConfig(filename= filename, level=logging.INFO,
+                            filemode= "w",
+                            format="%(asctime)s - %(levelname)s - %(message)s",
+                            datefmt="%Y-%m-%d %H:%M:%S")
+    if not logger.hasHandlers():
+        handler= RotatingFileHandler(filename, maxBytes= 5e+6, backupCount= 3) 
+        logger.addHandler(handler)
+
+    return logger
+
+system= user_logger("system.log")
+
 @contextmanager
 def db_conn(path):
     """Context manager to easily connect to sqlite3 databases."""
@@ -55,7 +66,7 @@ def db_conn(path):
         conn.commit()
     except Exception as e:
         conn.rollback()
-        logger.critical(f"SQL error: {e}")
+        system.critical(f"SQL error: {e}")
     finally:
         conn.close()
 
@@ -86,32 +97,32 @@ async def fork(event):
     
     return
 
-async def call_wrap(url, method, retries= 15, **kwargs): # change to aiohttp at some point b/c highly async 
+async def call_wrap(url, method, retries= 15, **kwargs):  
     """Wrapper for API calls."""
     for r in range(1, retries+1):
         try:
             response= await http_session.request(method, url, raise_for_status= True, **kwargs)  
             if r> 1:
-                logger.info(f"The {url} API call was successful! Params: {kwargs}") # you could also just set this to debug
+                system.info(f"The {url} API call was successful! Params: {kwargs}") # you could also just set this to debug
             return response
         except aiohttp.ClientResponseError as e:
                 code= e.status
                 if 400 <= code <= 499:
                     if code== 429:
-                        logger.error(f"API calls have been rate-limited. Retry {r}")
+                        system.error(f"API calls have been rate-limited. Retry {r}")
                         await asyncio.sleep(r)
                         continue
-                    logger.critical(f"Client side error: {e}")
+                    system.critical(f"Client side error: {e}")
                     break
                 else: 
-                    logger.error(f"Internal server error: {e}. Retry {r}")
+                    system.error(f"Internal server error: {e}. Retry {r}")
                     await asyncio.sleep(r) # might not need this
                     continue
         except aiohttp.ClientError as e:
-            logger.critical(f"Request failed: {e}")
+            system.critical(f"Request failed: {e}")
             break
         except Exception as e:
-            logger.critical(f"An error unrelated to the request caused an unexpected failure: {e}")
+            system.critical(f"An error unrelated to the request caused an unexpected failure: {e}")
             break
 
     return
@@ -494,9 +505,9 @@ async def callback(event):
 
 async def login(event): # to prevent SQLite locks
     """Login a user to Telegram."""
-    logger.info("Performing actions from command '/login'...")
 
     id= event.sender_id # got tired of typing it out
+    logger= user_logger(id)
 
     if id not in user_locks:
         user_locks[id]= asyncio.Lock()
@@ -588,7 +599,7 @@ async def login(event): # to prevent SQLite locks
                                         continue
                                     break
                                 break
-                    
+                   
                     if choice.data== b"QR":
                         # await event.delete()
                         try:
@@ -612,30 +623,38 @@ async def login(event): # to prevent SQLite locks
                                     continue
                                 break
                 except Exception as e:
-                    logger.critical(f"Error occurred in '/login': {e}")
                     await conv.send_message("Sorry, something went wrong during the login process. Please try submit '/login' again.")
 
         if await client.is_user_authorized():
             me= await client.get_me()
             await bot.send_message(id, f"Successfully signed in to Telegram as {me.username}.")
             user_sessions[id]= client.session.save()
+            username_dict[id]= me.username
 
     return
 
 async def start(event):
     """Sends a welcome message to the user when they start the bot."""
+    id= event.sender_id
+    logger= user_logger(id)
+
     logger.info("Performing actions from '/start'...")
 
     await bot.send_message(event.sender_id, "Hello! I am a crypto trading bot that is currently in development.") 
 
     return
 
+async def help(event):
+    """Instructs a user on actions to take when encountering an error."""
+    pass
+
 # bring this back at some point
 async def twoFA(event):
     """Allows user to enable 2FA."""
-    logger.info("Performing actions from '/twoFA'...")
-
     id= event.sender_id
+    logger= user_logger(id)
+
+    logger.info("Performing actions from '/twoFA'...")
 
     await bot.send_message(id, "This area is under construction.")
     '''if auth_flag:
@@ -649,10 +668,12 @@ async def twoFA(event):
 
 async def stats(event): # fix this
     """Display user PnL and win rate."""
+    id= event.sender_id
+    logger= user_logger(id)
+
     logger.info("Performing actions from '/stats'...")
 
     base_url= "https://api.mobula.io/api/"
-    id= event.sender_id
 
     wallet= wallet_dict.get(id)
     if not wallet:
@@ -663,8 +684,8 @@ async def stats(event): # fix this
         sesh_wall= [tok for tok, session in db.execute("SELECT token_wallet, session FROM info WHERE userID= ?", 
                                                        (id,)) if session== session_name_dict.get(id)]
 
-    data= requests.get(base_url+ "2/wallet/positions", headers= {"Authorization": mob_api_key}, params= {"wallet": wallet,
-                                                                                             "blockchains": "solana"}).json()["data"]
+    data= await (await call_wrap(base_url+ "2/wallet/positions", "get", headers= {"Authorization": mob_api_key}, params= {"wallet": wallet,
+                                                                                             "blockchains": "solana"})).json()["data"]
 
     # total PnL and Win rate
     tot_pnl= [trade["realizedPnlUSD"]- trade["totalFeesPaidUSD"] for trade in data]
@@ -685,9 +706,10 @@ async def stats(event): # fix this
 
 async def wipe(event):
     """Allows a user to erase all stored personal data."""
-    logger.info("Performing actions from '/wipe'...")
-
     id= event.sender_id
+    logger= user_logger(id)
+
+    logger.info("Performing actions from '/wipe'...")
     
     async with bot.conversation(event.chat_id, timeout= None) as conv:
         msg= await conv.send_message("This option will erase any personal data that has been stored. You will be prompted to provide another password and reenter your wallet details when you run '/trade'. Do you want to continue?",
@@ -716,9 +738,10 @@ async def wipe(event):
 
 async def trade(event):
     """Main trading logic."""
-    logger.info("Performing actions from command '/trade'...")
-
     id= event.sender_id
+    logger= user_logger(id)
+
+    logger.info("Performing actions from command '/trade'...")
     
     client= user_clients.get(id)
     
@@ -899,9 +922,10 @@ async def trade(event):
 
 async def stop(event):
     """Immediately stop all trading activity."""
-    logger.info("Performing actions from command '/stop'...")
-
     id= event.sender_id
+    logger= user_logger(id)
+
+    logger.info("Performing actions from command '/stop'...")
 
     kill_task= listener_task.get(id)
 
@@ -929,23 +953,23 @@ async def sweep(target= "."):
                 if not os.path.islink(f_obj):
                     file_size= (os.path.getsize(f_obj)/ 1e6)
                     size+= file_size
-                    if file.startswith("mybot") and file.endswith(".log"):
+                    if (file.startswith("mybot") or file.startswith("system")) and file.endswith(".log"):
                         size_dict[f_obj]= file_size
         size_dict= dict(sorted(size_dict.items(), key= lambda x: x[1], reverse= True))
             
         while size>= size_thres:
             deleted= False
             if not size_dict:
-                logger.debug("The storage usage of the cwd is above the provided threshold, but there are no .log files to delete! Increase storage size!")
+                system.debug("The storage usage of the cwd is above the provided threshold, but there are no .log files to delete! Increase storage size!")
                 break
             for file, val in list(size_dict.items()):
                 mtime= datetime.fromtimestamp(os.path.getmtime(file))
                 if (datetime.now()- mtime).total_seconds()>= time_thres:
-                    logger.info(f"I am deleting {os.path.basename(file)}. It is {val} mb.")
+                    system.info(f"I am deleting {os.path.basename(file)}. It is {val} mb.")
                     try:
                         os.remove(file)
                     except Exception as e:
-                        logger.error(f"I couldn't delete the file: {e}")
+                        system.error(f"I couldn't delete the file: {e}")
                         size_dict.pop(file, None)
                         continue
                     size_dict.pop(file, None)
@@ -953,7 +977,7 @@ async def sweep(target= "."):
                     size-= val
                     break 
             if not deleted:
-                logger.debug("The storage usage of the cwd is above the provided threshold, but no .log files are old enough to delete.")
+                system.debug("The storage usage of the cwd is above the provided threshold, but no .log files are old enough to delete.")
                 break
 
 
@@ -967,7 +991,7 @@ async def s_protocol(sig, event):
         return 
     
     event.set()
-    logger.info(f"Recieved exit signal: {sig}. Cleaning up...")
+    system.info(f"Recieved exit signal: {sig}. Cleaning up...")
     await asyncio.sleep(sig_wait)
     await bot.disconnect()
 
@@ -987,10 +1011,10 @@ async def main(): # remember not to create separate loops or else errors- keep e
     try:
         await bot.start(bot_token= bot_token)
     except ConnectionError as e:
-        logger.critical(f"{str(e)}, Exiting...")
+        system.critical(f"{str(e)}, Exiting...")
         raise
     
-    logger.info("Starting Bot...")
+    system.info("Starting Bot...")
 
     await bot.run_until_disconnected()
     await sweep()

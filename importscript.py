@@ -3,8 +3,6 @@
 import qrcode
 import base64 
 import asyncio
-import textwrap
-import requests
 import aiohttp
 import phonenumbers
 import logging
@@ -18,7 +16,7 @@ import re
 import os
 from io import BytesIO
 from types import SimpleNamespace
-from math import ceil, floor
+from math import ceil
 from contextlib import contextmanager
 from collections import defaultdict
 from twilio.rest import Client
@@ -29,6 +27,7 @@ from mnemonic import Mnemonic
 from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
 
+from flask import Flask
 from random import choice
 from string import ascii_letters, digits
 from signal import SIGINT, SIGTERM, SIGQUIT

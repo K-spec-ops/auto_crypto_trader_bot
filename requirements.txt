@@ -1,0 +1,12 @@
+# Python dependencies for the crypto trader bot
+
+aiohttp==3.13.5
+boto3==1.42.96
+cryptography==49.0.0
+mnemonic==0.21
+numpy==2.5.0
+phonenumbers==9.0.32
+qrcode==8.2
+solders==0.27.1
+telethon==1.44.0
+twilio==9.10.5
